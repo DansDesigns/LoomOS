@@ -7,7 +7,7 @@
 # AgentOS components, and produce a bootable system.
 #
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/YOUR/agentos/main/install.sh | bash
+#   curl -sL https://raw.githubusercontent.com/DansDesigns/LoomOS/main/install.sh | bash
 #   — or —
 #   bash install.sh
 #
@@ -27,7 +27,7 @@ die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 section() { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}\n"; }
 
 # ── Configuration (edit or pass as env vars before running) ──────────────────
-AGENTOS_REPO="${AGENTOS_REPO:-https://raw.githubusercontent.com/YOUR/agentos/main}"
+AGENTOS_REPO="${AGENTOS_REPO:-https://raw.githubusercontent.com/DansDesigns/LoomOS/main}"
 DEVUAN_MIRROR="${DEVUAN_MIRROR:-https://pkgmaster.devuan.org/merged}"
 DEVUAN_SUITE="${DEVUAN_SUITE:-excalibur}"          # Devuan 6 = excalibur
 HOSTNAME="${AGENTOS_HOSTNAME:-agentos}"
