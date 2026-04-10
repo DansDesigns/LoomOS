@@ -1,4 +1,4 @@
-# LoomOS
+# LoomOS - WIP, DO NOT USE YET
 An agenticOS combining STT, TTS & LLM.
 
 
