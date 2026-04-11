@@ -148,4 +148,4 @@ sleep 3
 tput cnorm 2>/dev/null || true
 
 # Hand off to the main installer
-exec /usr/local/bin/agentos-install
+exec ~/LoomOS/install.sh
