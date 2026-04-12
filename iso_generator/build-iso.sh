@@ -8,7 +8,7 @@
 # Repository: https://github.com/DansDesigns/LoomOS
 #
 # Requirements (installed automatically if missing):
-#   xorriso, cpio, busybox-static, debootstrap
+#   xorriso, cpio, busybox-static, bash-static, gcc, libc-dev, debootstrap
 #
 # Usage:
 #   chmod +x build-iso.sh
@@ -52,11 +52,14 @@ section "LoomOS ISO Builder"
 [[ $EUID -eq 0 ]] || die "Must run as root: sudo ./build-iso.sh"
 [[ -f "$INSTALL_SCRIPT" ]] || die "install.sh not found in $SCRIPT_DIR"
 
+# Strip Windows-style \r line endings from the installer script
+sed -i 's/\r//' "$INSTALL_SCRIPT" 2>/dev/null || true
+
 # Install required tools
 PKGS_NEEDED=()
-for pkg in xorriso cpio busybox-static isolinux syslinux-common \
+for pkg in xorriso cpio busybox-static bash-static isolinux syslinux-common \
            grub-pc-bin grub-efi-amd64-bin mtools debootstrap \
-           binutils dosfstools; do
+           binutils dosfstools gcc libc-dev; do
     dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || PKGS_NEEDED+=("$pkg")
 done
 
@@ -67,10 +70,10 @@ if [[ ${#PKGS_NEEDED[@]} -gt 0 ]]; then
 fi
 
 # Verify critical files
-[[ -f /usr/lib/ISOLINUX/isolinux.bin ]]            || die "isolinux.bin not found"
-[[ -f /usr/lib/ISOLINUX/isohdpfx.bin ]]            || die "isohdpfx.bin not found"
+[[ -f /usr/lib/ISOLINUX/isolinux.bin ]]             || die "isolinux.bin not found"
+[[ -f /usr/lib/ISOLINUX/isohdpfx.bin ]]             || die "isohdpfx.bin not found"
 [[ -f /usr/lib/syslinux/modules/bios/ldlinux.c32 ]] || die "ldlinux.c32 not found"
-[[ -f /usr/bin/busybox ]]                           || die "busybox not found"
+[[ -f /usr/bin/busybox ]]                            || die "busybox not found"
 
 log "All tools present"
 
@@ -129,25 +132,80 @@ BUSYBOX_BIN=$(find /usr -name "busybox" -type f 2>/dev/null | head -1)
 [[ -f "$BUSYBOX_BIN" ]] || die "busybox binary not found"
 
 cp "$BUSYBOX_BIN" "$INITRD_DIR/bin/busybox"
-chmod +x "$INITRD_DIR/bin/busybox"
+chmod 755 "$INITRD_DIR/bin/busybox"
 
-# Create symlinks for every applet busybox provides
+# Explicit sh symlink — MUST be done before the applet loop.
+# busybox --list omits 'sh' on some builds (compiled as a hardlink alias,
+# not a standalone applet), so we cannot rely on the loop for this.
+ln -sf busybox "$INITRD_DIR/bin/sh"
+log "bin/sh symlink created explicitly"
+
+# Create symlinks for every applet busybox provides.
+# Use relative targets — never absolute paths inside initramfs.
+# Absolute symlinks cause ELOOP (-40) at kernel boot.
 for applet in $("$BUSYBOX_BIN" --list 2>/dev/null); do
-    # Put in bin unless it's traditionally in sbin
+    # Skip sh — already handled explicitly above
+    [[ "$applet" == "sh" ]] && continue
     case "$applet" in
         blkid|fdisk|fsck|getty|halt|ifconfig|init|insmod|ip|\
         klogd|losetup|lsmod|mdev|mkdosfs|mkfs*|mkswap|modprobe|\
-        pivot_root|poweroff|reboot|rmmod|route|runlevel|start-stop-daemon|\
+        pivot_root|poweroff|reboot|rmmod|route|runlevel|\
         sulogin|swapoff|swapon|switch_root|syslogd|udhcpd|uevent)
-            ln -sf /bin/busybox "$INITRD_DIR/sbin/$applet" 2>/dev/null || true
+            ln -sf ../bin/busybox "$INITRD_DIR/sbin/$applet" 2>/dev/null || true
             ;;
         *)
-            ln -sf /bin/busybox "$INITRD_DIR/bin/$applet"  2>/dev/null || true
+            ln -sf busybox "$INITRD_DIR/bin/$applet" 2>/dev/null || true
             ;;
     esac
 done
 
 log "Busybox installed ($(ls "$INITRD_DIR/bin/" | wc -l) applets)"
+
+# =============================================================================
+# BASH STATIC — install.sh uses bash arrays and bashisms, needs real bash
+# =============================================================================
+BASH_STATIC=""
+for candidate in /bin/bash-static /usr/bin/bash-static; do
+    if [[ -f "$candidate" ]]; then
+        BASH_STATIC="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$BASH_STATIC" ]]; then
+    apt-get install -y bash-static 2>/dev/null || true
+    for candidate in /bin/bash-static /usr/bin/bash-static; do
+        [[ -f "$candidate" ]] && BASH_STATIC="$candidate" && break
+    done
+fi
+
+[[ -n "$BASH_STATIC" ]] || die "bash-static not found. Install with: apt-get install bash-static"
+
+file "$BASH_STATIC" | grep -q "statically linked" \
+    || die "$BASH_STATIC is not statically linked — ldd shows dependencies that won't exist in initramfs"
+
+cp "$BASH_STATIC" "$INITRD_DIR/bin/bash"
+chmod 755 "$INITRD_DIR/bin/bash"
+
+ln -sf /bin/bash "$INITRD_DIR/usr/bin/bash"
+
+BASH_SIZE=$(du -sh "$INITRD_DIR/bin/bash" | cut -f1)
+log "bash-static installed: $BASH_SIZE"
+
+# Warn if bash-static contains AVX/AVX2 instructions that would kill Ivy Bridge.
+# We can't recompile it here, but we can warn loudly so the user knows where
+# to look if the installer crashes after /init hands off successfully.
+if command -v objdump >/dev/null 2>&1; then
+    if objdump -d "$INITRD_DIR/bin/bash" 2>/dev/null \
+            | grep -qE '\symm[0-9]|\szmm[0-9]|vpcmp|vpbroadcast|vmovd|vmovq'; then
+        warn "bash-static may contain AVX/AVX2 instructions"
+        warn "This could cause an illegal instruction fault on i5-3rd gen (Ivy Bridge)"
+        warn "If boot fails after the LoomOS banner appears, rebuild bash-static"
+        warn "from source with: CFLAGS='-march=x86-64 -O1' ./configure && make"
+    else
+        log "bash-static: no AVX/AVX2 instructions detected, safe for Ivy Bridge"
+    fi
+fi
 
 # =============================================================================
 # KERNEL MODULES — copy essential drivers for broad hardware support
@@ -157,7 +215,6 @@ info "Copying kernel modules..."
 KMOD_SRC="/lib/modules/$KVER"
 
 if [[ -d "$KMOD_SRC" ]]; then
-    # Copy modules needed to boot and find storage on most hardware
     ESSENTIAL_MODS=(
         "kernel/fs/ext4"
         "kernel/fs/jbd2"
@@ -184,7 +241,6 @@ if [[ -d "$KMOD_SRC" ]]; then
         fi
     done
 
-    # Copy module metadata files
     for f in modules.dep modules.dep.bin modules.alias modules.alias.bin \
               modules.order modules.builtin modules.builtin.bin \
               modules.symbols modules.symbols.bin; do
@@ -198,7 +254,7 @@ else
 fi
 
 # =============================================================================
-# NETWORK TOOLS — wget and udhcpc are in busybox, but we need resolv.conf
+# NETWORK — resolv.conf, hosts, udhcpc script
 # =============================================================================
 cat > "$INITRD_DIR/etc/resolv.conf" <<'EOF'
 nameserver 1.1.1.1
@@ -209,7 +265,6 @@ cat > "$INITRD_DIR/etc/hosts" <<'EOF'
 127.0.0.1 localhost
 EOF
 
-# udhcpc script — busybox udhcpc needs this to actually set IP
 mkdir -p "$INITRD_DIR/usr/share/udhcpc"
 cat > "$INITRD_DIR/usr/share/udhcpc/default.script" <<'EOF'
 #!/bin/sh
@@ -238,78 +293,260 @@ chmod +x "$INITRD_DIR/install.sh"
 log "install.sh embedded"
 
 # =============================================================================
-# /init — THE ENTRY POINT
-# This is what the kernel runs first. It sets up the environment
-# then launches our installer. devtmpfs populates /dev automatically.
+# /init.sh — THE SETUP LOGIC
 # =============================================================================
-cat > "$INITRD_DIR/init" <<'INITEOF'
-#!/bin/sh
-# LoomOS initramfs /init
-# Sets up minimal environment then launches installer
-
+# Executed by the static /init ELF binary below. No shebang line — bash is
+# invoked explicitly by the C launcher so the kernel never parses a shebang.
+# =============================================================================
+cat > "$INITRD_DIR/init.sh" <<'INITEOF'
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
 # Mount essential virtual filesystems
-mount -t proc     proc     /proc
-mount -t sysfs    sysfs    /sys
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || \
-    mount -t tmpfs tmpfs /dev
+mount -t proc     proc     /proc     2>/dev/null
+mount -t sysfs    sysfs    /sys      2>/dev/null
+mount -t devtmpfs devtmpfs /dev      2>/dev/null || mount -t tmpfs tmpfs /dev
+mount -t tmpfs    tmpfs    /tmp      2>/dev/null
+mount -t tmpfs    tmpfs    /run      2>/dev/null
 
-# Create essential /dev entries if devtmpfs didn't provide them
-[ -c /dev/console ]  || mknod /dev/console  c 5 1
-[ -c /dev/null ]     || mknod /dev/null     c 1 3
-[ -c /dev/zero ]     || mknod /dev/zero     c 1 5
-[ -c /dev/tty ]      || mknod /dev/tty      c 5 0
-[ -c /dev/tty1 ]     || mknod /dev/tty1     c 4 1
-[ -c /dev/urandom ]  || mknod /dev/urandom  c 1 9
-[ -c /dev/random ]   || mknod /dev/random   c 1 8
+# /dev/pts for terminal support
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null || true
 
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /run
+# Ensure essential device nodes exist (devtmpfs may have missed some)
+[ -c /dev/console ] || mknod /dev/console  c 5 1
+[ -c /dev/null ]    || mknod /dev/null     c 1 3
+[ -c /dev/zero ]    || mknod /dev/zero     c 1 5
+[ -c /dev/tty ]     || mknod /dev/tty      c 5 0
+[ -c /dev/tty1 ]    || mknod /dev/tty1     c 4 1
+[ -c /dev/tty2 ]    || mknod /dev/tty2     c 4 2
+[ -c /dev/urandom ] || mknod /dev/urandom  c 1 9
+[ -c /dev/random ]  || mknod /dev/random   c 1 8
 
-# Set hostname
 hostname loomos-install 2>/dev/null || true
 
-# Load essential kernel modules
-for mod in ext4 vfat fat nls_cp437 nls_iso8859_1 \
-           usb_storage xhci_hcd ehci_hcd uhci_hcd \
-           ahci libata sd_mod nvme nvme_core \
-           e1000 e1000e r8169 igb ixgbe \
-           virtio_net virtio_blk virtio_pci; do
+# Load essential storage and network modules
+for mod in \
+    ext4 jbd2 mbcache \
+    vfat fat nls_cp437 nls_iso8859_1 \
+    usb_storage xhci_hcd ehci_hcd uhci_hcd uas \
+    ahci libata sd_mod sr_mod \
+    nvme nvme_core nvme_fabrics \
+    e1000 e1000e r8169 igb ixgbe tg3 \
+    virtio_net virtio_blk virtio_pci; do
     modprobe "$mod" 2>/dev/null || true
 done
 
-# Give hardware time to settle
 sleep 2
 
-# Set up network on all interfaces
+# Bring up network interfaces
 for iface in $(ls /sys/class/net/ 2>/dev/null | grep -v lo); do
     ip link set "$iface" up 2>/dev/null || \
         ifconfig "$iface" up 2>/dev/null || true
 done
 
-# Try DHCP on ethernet interfaces (background, non-blocking)
-for iface in $(ls /sys/class/net/ 2>/dev/null | grep -E '^(eth|en|em|eno|ens|enp)'); do
+# DHCP on ethernet interfaces — background, non-blocking
+for iface in $(ls /sys/class/net/ 2>/dev/null | grep -vE '^(lo|wl)'); do
     udhcpc -i "$iface" -t 8 -q -n \
         -s /usr/share/udhcpc/default.script \
         2>/dev/null &
 done
-# Brief wait for at least one interface to get an address
+
 sleep 4
 
-# Clear screen and launch installer
-clear
-exec /install.sh
+# Redirect I/O to console
+exec </dev/console
+exec >/dev/console
+exec 2>/dev/console
 
-# If installer exits, drop to shell
-echo ""
-echo "Installer exited. Dropping to shell."
-echo "Run /install.sh to restart installer."
+# Sanity checks before handing to installer
+if [ ! -x /bin/bash ]; then
+    echo "FATAL: /bin/bash not found or not executable in initramfs"
+    echo "Dropping to sh shell for debugging"
+    exec /bin/sh
+fi
+
+if [ ! -f /install.sh ]; then
+    echo "FATAL: /install.sh not found in initramfs"
+    exec /bin/sh
+fi
+
+chmod +x /install.sh
+clear
+
+exec /bin/bash /install.sh
+
+# Should never reach here
+echo "Installer exited or bash exec failed — dropping to shell"
+echo "Run manually: bash /install.sh"
 exec /bin/sh
 INITEOF
-chmod +x "$INITRD_DIR/init"
+chmod 755 "$INITRD_DIR/init.sh"
+log "/init.sh written"
 
-log "/init written"
+# =============================================================================
+# /init — STATIC ELF BINARY (compiled from C)
+# =============================================================================
+# The kernel executes /init directly as PID 1. A shebang-based shell script
+# is unreliable here for two reasons:
+#
+#   ENOEXEC (-8):  kernel cannot exec a script if its shebang interpreter is
+#                  missing or the line has \r\n (Windows) line endings
+#   ELOOP   (-40): absolute symlinks inside initramfs loop back on themselves
+#                  because there is no host root to resolve against
+#
+# Solution: compile a tiny static C binary. The kernel sees a valid ELF,
+# executes main(), which calls execve() directly — no shebang parsing, no
+# symlink resolution, no dynamic linker required.
+#
+# CPU compatibility (-march=x86-64):
+#   Ivy Bridge (i5 3rd gen, 2012) is x86_64 but lacks AVX2, BMI2, and later
+#   ISA extensions. If gcc targets a newer microarchitecture baseline (e.g.
+#   x86-64-v3 or -march=native on a modern build host), it can emit ymm/zmm
+#   instructions that produce an illegal instruction fault (#UD) on Ivy Bridge
+#   before a single line of init.sh executes — manifesting as exit code
+#   0x00000100 and a kernel panic.
+#
+#   -march=x86-64  = SSE2-only baseline guaranteed on every x86_64 CPU
+#   -mtune=generic = schedule for a mix of CPUs, not the build host
+#   -O1            = avoids autovectorisation that can emit AVX even without
+#                    an explicit -march=native flag on newer gcc versions
+# =============================================================================
+info "Compiling static /init launcher (x86-64 baseline, safe for Ivy Bridge)..."
+
+cat > "$WORK/init_launcher.c" <<'EOF'
+/*
+ * LoomOS initramfs /init launcher
+ *
+ * Compiled as a static ELF so the kernel can exec it directly as PID 1.
+ * Uses execve() to hand off to bash running /init.sh.
+ * Three fallback levels ensure a debug shell is always reachable.
+ *
+ * Built with -march=x86-64 -O1 so only SSE2-baseline instructions are
+ * emitted — safe on every x86_64 CPU including Ivy Bridge (i5 3rd gen, 2012).
+ */
+#include <unistd.h>
+
+int main(void)
+{
+    /* Primary: bash-static running our setup script */
+    {
+        char *argv[] = { "/bin/bash", "/init.sh", (char *)0 };
+        char *envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin", (char *)0 };
+        execve("/bin/bash", argv, envp);
+    }
+
+    /* Fallback 1: busybox ash running our setup script */
+    {
+        char *argv[] = { "/bin/sh", "/init.sh", (char *)0 };
+        char *envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin", (char *)0 };
+        execve("/bin/sh", argv, envp);
+    }
+
+    /* Fallback 2: bare busybox ash for manual debugging */
+    {
+        char *argv[] = { "/bin/sh", (char *)0 };
+        char *envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin", (char *)0 };
+        execve("/bin/sh", argv, envp);
+    }
+
+    /*
+     * All three execve() calls failed — /bin/bash and /bin/sh are both
+     * missing or non-executable. return 1 causes exit code 0x00000100
+     * and a kernel panic. Check the initramfs verification output above.
+     */
+    return 1;
+}
+EOF
+
+# -march=x86-64  : SSE2-only baseline — runs on every x86_64 CPU (inc. Ivy Bridge)
+# -mtune=generic : schedule for mixed CPUs, not the build host
+# -O1            : avoids autovectorisation that emits AVX on modern gcc
+# -mno-avx       : belt-and-braces: explicitly prohibit AVX emission
+# -mno-avx2      : belt-and-braces: explicitly prohibit AVX2 emission
+gcc -static -O1 -march=x86-64 -mtune=generic -mno-avx -mno-avx2 \
+    -o "$INITRD_DIR/init" "$WORK/init_launcher.c" \
+    || die "Failed to compile static /init launcher — is gcc + libc-dev installed?"
+
+chmod 755 "$INITRD_DIR/init"
+
+# Verify statically linked
+file "$INITRD_DIR/init" | grep -q "statically linked" \
+    || die "/init compiled but is NOT statically linked — will fail as PID 1"
+
+# Verify no AVX/AVX2 instructions slipped through
+if command -v objdump >/dev/null 2>&1; then
+    if objdump -d "$INITRD_DIR/init" 2>/dev/null \
+            | grep -qE '\symm[0-9]|\szmm[0-9]|vpcmp|vpbroadcast|vmovd|vmovq'; then
+        die "/init still contains AVX/AVX2 instructions despite -mno-avx -mno-avx2" \
+            "— check your gcc version and toolchain configuration"
+    else
+        log "/init: baseline x86-64 only — safe for i5-3rd gen (Ivy Bridge)"
+    fi
+fi
+
+INIT_SIZE=$(du -sh "$INITRD_DIR/init" | cut -f1)
+log "Static /init compiled and verified: $INIT_SIZE"
+
+# =============================================================================
+# VERIFY INITRAMFS BEFORE PACKING
+# =============================================================================
+info "Verifying initramfs contents..."
+
+VERIFY_FAIL=0
+for check in \
+    "bin/busybox:busybox binary" \
+    "bin/bash:bash-static binary" \
+    "bin/sh:sh symlink" \
+    "init:static init ELF" \
+    "init.sh:init setup script" \
+    "install.sh:installer script" \
+    "usr/share/udhcpc/default.script:udhcpc script"; do
+    path="${check%%:*}"
+    desc="${check##*:}"
+    if [[ ! -e "$INITRD_DIR/$path" ]]; then
+        warn "MISSING: $path ($desc)"
+        VERIFY_FAIL=1
+    fi
+done
+
+# /init must be a real ELF, not a symlink
+if [[ -L "$INITRD_DIR/init" ]]; then
+    warn "PROBLEM: /init is a symlink — kernel requires a real ELF binary"
+    VERIFY_FAIL=1
+fi
+
+# /init must be statically linked
+if [[ -f "$INITRD_DIR/init" ]]; then
+    if file "$INITRD_DIR/init" | grep -q "dynamically linked"; then
+        warn "PROBLEM: /init is dynamically linked — will fail as PID 1"
+        VERIFY_FAIL=1
+    else
+        log "/init: statically linked ELF OK"
+    fi
+fi
+
+# /bin/bash must be statically linked
+if [[ -f "$INITRD_DIR/bin/bash" ]]; then
+    if file "$INITRD_DIR/bin/bash" | grep -q "dynamically linked"; then
+        warn "PROBLEM: /bin/bash is dynamically linked — will fail in initramfs"
+        warn "         Install bash-static package on your build machine"
+        VERIFY_FAIL=1
+    else
+        log "bash: statically linked OK"
+    fi
+fi
+
+# /bin/sh must resolve (symlink is fine, -e follows it)
+if [[ -e "$INITRD_DIR/bin/sh" ]]; then
+    log "bin/sh: present OK"
+else
+    warn "bin/sh missing — creating fallback symlink"
+    ln -sf busybox "$INITRD_DIR/bin/sh"
+    log "bin/sh: fallback symlink created"
+fi
+
+[[ $VERIFY_FAIL -eq 0 ]] || die "Initramfs verification failed — fix above issues before continuing"
+log "Initramfs verification passed"
 
 # =============================================================================
 # PACK INITRAMFS
@@ -337,10 +574,9 @@ log "Kernel copied: $VMLINUZ_SIZE"
 # =============================================================================
 section "Configuring Boot"
 
-cp /usr/lib/ISOLINUX/isolinux.bin      "$ISO_DIR/boot/isolinux/"
+cp /usr/lib/ISOLINUX/isolinux.bin             "$ISO_DIR/boot/isolinux/"
 cp /usr/lib/syslinux/modules/bios/ldlinux.c32 "$ISO_DIR/boot/isolinux/"
 
-# Copy optional menu modules if present
 for mod in libcom32.c32 libutil.c32 menu.c32 vesamenu.c32; do
     src="/usr/lib/syslinux/modules/bios/$mod"
     [[ -f "$src" ]] && cp "$src" "$ISO_DIR/boot/isolinux/" || true
@@ -391,7 +627,6 @@ menuentry "LoomOS Installer (safe — no KMS)" {
 }
 GRUBEOF
 
-# Build GRUB EFI image
 grub-mkimage \
     --format=x86_64-efi \
     --output="$ISO_DIR/EFI/boot/bootx64.efi" \
@@ -401,13 +636,10 @@ grub-mkimage \
     fat ext2 loadenv configfile \
     2>/dev/null || die "grub-mkimage failed"
 
-# Copy GRUB EFI modules
 mkdir -p "$ISO_DIR/boot/grub/x86_64-efi"
 cp -r /usr/lib/grub/x86_64-efi/*.mod \
       "$ISO_DIR/boot/grub/x86_64-efi/" 2>/dev/null || true
 
-# Build EFI system partition image (FAT32, embedded in ISO)
-# This is required for proper UEFI booting from ISO
 EFI_IMG="$ISO_DIR/boot/grub/efi.img"
 dd if=/dev/zero of="$EFI_IMG" bs=1M count=4 2>/dev/null
 mkfs.fat -F32 "$EFI_IMG" >/dev/null 2>&1
@@ -429,7 +661,6 @@ echo "https://github.com/DansDesigns/LoomOS" >> "$ISO_DIR/.disk/info"
 # =============================================================================
 section "Building ISO: $ISO_OUTPUT"
 
-# Extract MBR from isolinux for hybrid boot
 dd if=/usr/lib/ISOLINUX/isohdpfx.bin \
    of="$WORK/mbr.bin" bs=432 count=1 2>/dev/null
 
@@ -460,16 +691,14 @@ xorriso -as mkisofs \
     "$ISO_DIR" \
     2>&1 | grep -v "^xorriso" || true
 
-# Verify ISO was created
 [[ -f "$ISO_OUTPUT" ]] || die "ISO creation failed — $ISO_OUTPUT not found"
 
 # =============================================================================
-# VERIFY BOOT SECTORS ARE PRESENT AND CORRECT
+# VERIFY ISO
 # =============================================================================
 section "Verifying ISO"
 
-# Check ISO is valid
-xorriso -indev "$ISO_OUTPUT" -report_about WARNING \
+xorriso -indev "$ISO_OUTPUT" \
     -find / -type f -name "vmlinuz" \
     2>/dev/null | grep -q "vmlinuz" \
     && log "Kernel found in ISO" \
@@ -493,7 +722,6 @@ xorriso -indev "$ISO_OUTPUT" \
     && log "UEFI boot loader verified" \
     || warn "UEFI boot loader not found"
 
-# Check MBR contains boot code (first 2 bytes should not be 00 00)
 MBR_CHECK=$(dd if="$ISO_OUTPUT" bs=2 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
 [[ "$MBR_CHECK" != "0000" ]] \
     && log "MBR boot code present (hybrid boot verified)" \
@@ -527,6 +755,5 @@ echo -e "  ${CYAN}qemu-system-x86_64 -m 2G -cdrom $ISO_OUTPUT -boot d -enable-kv
 echo -e "  ${CYAN}    -bios /usr/share/ovmf/OVMF.fd${NC}"
 echo ""
 
-# Cleanup
 rm -rf "$WORK"
 log "Build workspace cleaned"
